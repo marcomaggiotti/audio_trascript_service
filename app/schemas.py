@@ -60,6 +60,9 @@ class Job(BaseModel):
     temperature_fallback: bool = Field(False, description="Re-decode windows whose text repeats or is unsure")
     condition_on_previous_text: bool = Field(False, description="Prompt each window with the text before it")
     initial_prompt: str | None = Field(None, description="Vocabulary or style hint given to every window")
+    encoder_precision: str | None = Field(None, description="Requested encoder precision (fp32, int8); None = default")
+    decoder_precision: str | None = Field(None, description="Requested decoder precision (fp32, int8); None = default")
+    precision: dict[str, str] | None = Field(None, description="Precision actually used: {encoder, decoder}")
     error: str | None = None
     model: str | None = None
     created_at: datetime = Field(default_factory=utcnow)
@@ -79,6 +82,7 @@ class JobSummary(BaseModel):
 
 class TranscriptResponse(Transcript):
     model: str | None
+    precision: dict[str, str] | None = Field(None, description="Encoder and decoder precision used: fp32 or int8")
     metrics: InferenceMetrics | None
 
 

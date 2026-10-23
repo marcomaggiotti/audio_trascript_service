@@ -23,6 +23,7 @@ import logging
 import os
 import zlib
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
@@ -105,6 +106,32 @@ class ModelLoadError(RuntimeError):
     pass
 
 
+PRECISIONS = ("fp32", "int8")
+
+
+def _release_memory() -> None:
+    """Hand freed memory back to the OS (glibc keeps it otherwise, so RSS would stay at the swap's peak)."""
+    import ctypes
+    import gc
+
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):  # not glibc (macOS, musl): nothing to do
+        pass
+
+
+def onnx_precision(path: Path) -> str:
+    """'int8' if the graph was dynamically quantized (scripts/export_whisper_onnx.py), else 'fp32'.
+
+    Op types are stored as plain strings in the protobuf, so this needs no onnx package and no full parse.
+    """
+    import mmap
+
+    with path.open("rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as data:
+        return "int8" if data.find(b"DynamicQuantizeLinear") >= 0 or data.find(b"MatMulInteger") >= 0 else "fp32"
+
+
 @dataclass
 class WhisperTokens:
     """Special token ids, resolved from the tokenizer and generation config."""
@@ -170,7 +197,15 @@ class OnnxWhisperTranscriber:
         self.n_mels = n_mels
         self.max_new_tokens = max_new_tokens
         self.name = name
+        # Precision of each part, and the files of every precision exported (from_dir fills these in).
+        self.precision: dict[str, str] | None = None
+        self.variants: dict[str, dict[str, Path]] = {}
+        self._load_session: Callable[[Path], object] | None = None
+        self._bind(encoder, decoder)
 
+    def _bind(self, encoder, decoder) -> None:
+        """Use these sessions, and read the input/output layout the decoding loop needs from them."""
+        self.encoder, self.decoder = encoder, decoder
         self._encoder_input = encoder.get_inputs()[0].name
         decoder_inputs = {i.name: i for i in decoder.get_inputs()}
         if {"input_ids", "encoder_hidden_states"} - decoder_inputs.keys():
@@ -224,7 +259,62 @@ class OnnxWhisperTranscriber:
         n_mels = _load_json(path / "preprocessor_config.json").get("feature_size", 80)
         model_id = path / "model_id.txt"  # written by scripts/export_whisper_onnx.py
         name = model_id.read_text().strip() if model_id.exists() else os.path.basename(path.resolve())
-        return cls(encoder, decoder, tokenizer, tokens, n_mels=n_mels, max_new_tokens=max_new_tokens, name=name)
+        transcriber = cls(encoder, decoder, tokenizer, tokens, n_mels=n_mels, max_new_tokens=max_new_tokens, name=name)
+        transcriber.precision = {"encoder": onnx_precision(path / "encoder_model.onnx"),
+                                 "decoder": onnx_precision(path / decoder_file)}
+        # The other precision of each part, if the export kept it (encoder_model.int8.onnx, ...).
+        for part, default_file in (("encoder", "encoder_model.onnx"), ("decoder", decoder_file)):
+            stem = default_file.removesuffix(".onnx")
+            files = {transcriber.precision[part]: path / default_file}
+            for p in PRECISIONS:
+                if p not in files and (path / f"{stem}.{p}.onnx").exists():
+                    files[p] = path / f"{stem}.{p}.onnx"
+            transcriber.variants[part] = files
+        transcriber._load_session = lambda file: ort.InferenceSession(str(file), options, providers=providers)
+        return transcriber
+
+    @property
+    def available_precisions(self) -> dict[str, list[str]]:
+        """Precisions a job can ask for, per part ({} if unknown: then only the default)."""
+        return {part: sorted(files) for part, files in self.variants.items()}
+
+    @contextmanager
+    def precision_for(self, encoder: str | None = None, decoder: str | None = None):
+        """Transcribe with these precisions inside the block (None = the default), then go back.
+
+        A part in another precision is swapped in: the default one is released first, the requested one
+        loaded (1-2 s for tiny), and after the block the default is loaded again. So two versions of a part
+        are never in memory together (the all-fp32 pair alone peaks ~320 MB on tiny). Jobs run one at a
+        time (WORKER_CONCURRENCY=1), so swapping is safe. Yields the precision actually used per part.
+        """
+        default = dict(self.precision or {})
+        wanted = {"encoder": encoder or default.get("encoder"), "decoder": decoder or default.get("decoder")}
+        for part, p in wanted.items():
+            if p != default.get(part) and p not in self.variants.get(part, {}):
+                raise ValueError(f"{part} precision {p} isn't available "
+                                 f"(this export has {', '.join(self.variants.get(part) or [default.get(part) or '?'])})")
+        swapped = [part for part in ("encoder", "decoder") if wanted[part] != default.get(part)]
+        try:
+            self._swap({part: wanted[part] for part in swapped})
+            yield wanted
+        finally:
+            if swapped:
+                self._swap({part: default[part] for part in swapped})
+                _release_memory()  # the variant's weights are freed by the swap: return them too
+
+    def _swap(self, precisions: dict[str, str]) -> None:
+        """Replace these parts' sessions with the given precision, releasing the old session first."""
+        if not precisions:
+            return
+        sessions = {"encoder": self.encoder, "decoder": self.decoder}
+        for part in precisions:
+            sessions[part] = None
+            setattr(self, part, None)  # drop the last reference before loading the replacement
+        _release_memory()
+        for part, p in precisions.items():
+            sessions[part] = self._load_session(self.variants[part][p])
+        self._bind(sessions["encoder"], sessions["decoder"])
+
 
     # ------------------------------------------------------------------ public
 

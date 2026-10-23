@@ -40,6 +40,7 @@ This service keeps only that part. It has no search or embeddings.
 | `GET` | `/jobs/{id}` | Status, `stage` (decoding, transcribing), `progress` (0–1, updated after each 30 s window), `queue_position` while queued, model, timings and metrics, or the error if it failed |
 | `GET` | `/jobs/{id}/transcript?format=` | The transcript. `409` until it's ready, `422` if the job failed |
 | `DELETE` | `/jobs/{id}` | Forget a job (and its upload if it's still queued) |
+| `GET` | `/config` | How audio becomes text here: decoding, windows, log-mel features (fixed by Whisper) and the model, its encoder/decoder precision (read from the ONNX graphs) and decoding defaults |
 | `GET` | `/languages` | Languages the loaded model supports, and the default |
 | `GET` | `/health` | Model status, queue depth, active jobs |
 | `GET` | `/healthz` | Liveness: `503` if the speech model didn't load |
@@ -160,6 +161,25 @@ python scripts/wer.py data/benchmark/clips --model-dir models/whisper-tiny --mod
 When `API_TOKEN` is set, `/transcribe`, `/jobs`, `/languages`, `/benchmark/…` and `/benchmarks` need
 `X-API-Key: <token>` or `Authorization: Bearer <token>`. The web page asks for the token once (top
 right). The page itself, `/health`, `/healthz` and the API docs (`/docs`) stay public.
+
+### Encoder and decoder precision
+
+The image keeps both precisions of each part of the model: the encoder in fp32 (the default) and int8, the
+decoder in int8 (the default) and fp32. `POST /jobs` and `POST /transcribe` take `encoder=fp32|int8` and
+`decoder=fp32|int8`; the job and its transcript record the pair used (`precision`). The default pair stays
+loaded; a job that asks for another part swaps it in (the default one is released first, the requested one
+loaded in under a second for tiny) and the default is loaded back afterwards, so two versions of a part are
+never in memory together. Measured on whisper-tiny, one thread, low-memory mode, a 6 s voice note:
+
+| Encoder / decoder | Peak RSS | Time | Note |
+|---|---|---|---|
+| fp32 / int8 (default) | 290 MB | 0.6 s | |
+| fp32 / fp32 | 312 MB | 1.5 s | most accurate (WER 5.0% vs 5.7% on the test set) |
+| int8 / int8 | 209 MB | 0.9 s | garbles real speech |
+| int8 / fp32 | 288 MB | 1.3 s | garbles real speech |
+
+`GET /config` lists what the export has (`model.available_precisions`). `--no-variants` on the export keeps
+only the default pair (about 120 MB smaller image; jobs can't choose).
 
 ## Run locally
 

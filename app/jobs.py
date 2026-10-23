@@ -181,8 +181,16 @@ class TranscriptionService:
             options = DecodingOptions(temperature_fallback=job.temperature_fallback,
                                       condition_on_previous_text=job.condition_on_previous_text,
                                       initial_prompt=job.initial_prompt)
-            result = self.transcriber.transcribe(audio, language=job.language, on_progress=progress,
-                                                 options=options)
+            switch = getattr(self.transcriber, "precision_for", None)  # absent on test fakes
+            if switch is None:
+                job.precision = getattr(self.transcriber, "precision", None)
+                result = self.transcriber.transcribe(audio, language=job.language, on_progress=progress,
+                                                     options=options)
+            else:
+                with switch(job.encoder_precision, job.decoder_precision) as used:
+                    job.precision = used
+                    result = self.transcriber.transcribe(audio, language=job.language, on_progress=progress,
+                                                         options=options)
             t2 = time.perf_counter()
         except Exception as e:
             logger.exception("Transcription failed for %s", job_id)

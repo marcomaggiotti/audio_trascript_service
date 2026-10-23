@@ -19,6 +19,8 @@ Pipeline (each step keeps the graphs runnable on the runtime's onnxruntime):
      encoder int8 7.1%, and the voice note "Take a bottle of milk and kilogram of flour." became
      "Thank you. A little bit of milk and I'll take you to the flower.".
   5. Merge decoder + decoder_with_past into decoder_model_merged.onnx (shared weights, If node).
+  With --variants (the default) the other precision of each part is kept too, as encoder_model.<p>.onnx and
+  decoder_model_merged.<p>.onnx, so a job can ask for it (POST /jobs encoder_precision / decoder_precision).
   --quantize all also quantizes the encoder (smallest, worse transcripts); --quantize none (or --fp32) skips
   step 4 (about +90 MB of RAM for tiny, a little more accurate).
 """
@@ -29,7 +31,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-KEEP = {"encoder_model.onnx", "decoder_model_merged.onnx"}
+KEEP = {"encoder_model.onnx", "decoder_model_merged.onnx",  # the defaults the service loads
+        # the other precision of each part, loaded only by jobs that ask for it (--variants)
+        "encoder_model.fp32.onnx", "encoder_model.int8.onnx",
+        "decoder_model_merged.fp32.onnx", "decoder_model_merged.int8.onnx"}
 
 
 def untie_lm_head(path: Path) -> None:
@@ -139,11 +144,41 @@ def quantize(path: Path) -> None:
     import onnx
     from onnxruntime.quantization import QuantType, quantize_dynamic
 
-    tmp = path.with_suffix(".int8.onnx")
+    tmp = path.with_name(path.name + ".quantizing")
     # QInt8 weights, per output channel. reduce_range (7-bit) is only useful on AVX2/AVX-512 CPUs without VNNI.
     quantize_dynamic(str(path), str(tmp), weight_type=QuantType.QInt8, per_channel=True,
                      extra_options={"DefaultTensorType": onnx.TensorProto.FLOAT})
     tmp.replace(path)
+
+
+def build_precisions(output: Path, default: dict[str, str], variants: bool) -> None:
+    """encoder_model.onnx / decoder_model_merged.onnx in the default precision, and with `variants` the other
+    precision as encoder_model.<p>.onnx / decoder_model_merged.<p>.onnx. INT8 graphs are quantized copies."""
+    from optimum.onnx.graph_transformations import merge_decoders
+
+    wanted = {part: {"fp32", "int8"} if variants else {default[part]} for part in default}
+    encoder = output / "encoder_model.onnx"
+    if "int8" in wanted["encoder"]:
+        shutil.copy(encoder, output / "encoder_model.int8.onnx")
+        quantize(output / "encoder_model.int8.onnx")
+    if default["encoder"] == "int8":
+        if variants:
+            shutil.copy(encoder, output / "encoder_model.fp32.onnx")
+        (output / "encoder_model.int8.onnx").replace(encoder)
+
+    decoders = ("decoder_model", "decoder_with_past_model")
+    for precision in sorted(wanted["decoder"]):
+        names = [f"{d}.onnx" for d in decoders]
+        if precision == "int8":
+            for d in decoders:
+                shutil.copy(output / f"{d}.onnx", output / f"{d}.int8.onnx")
+                quantize(output / f"{d}.int8.onnx")
+            names = [f"{d}.int8.onnx" for d in decoders]
+        target = "decoder_model_merged.onnx" if precision == default["decoder"] else f"decoder_model_merged.{precision}.onnx"
+        merge_decoders(output / names[0], output / names[1], save_path=output / target, strict=False)
+        if precision == "int8":
+            for name in names:
+                (output / name).unlink()
 
 
 def smoke_test(output: Path) -> None:
@@ -178,6 +213,8 @@ def main() -> int:
                         help="INT8 weights for: the decoder only (default), encoder and decoder (smaller, but "
                              "garbles real speech), or nothing")
     parser.add_argument("--fp32", action="store_true", help="Same as --quantize none")
+    parser.add_argument("--no-variants", dest="variants", action="store_false",
+                        help="Only the default precision of each part (smaller image; jobs can't choose)")
     parser.add_argument("--prune", action="store_true",
                         help="Delete exported graphs the service does not load (smaller Docker image)")
     args = parser.parse_args()
@@ -188,7 +225,6 @@ def main() -> int:
 
     import json
 
-    from optimum.onnx.graph_transformations import merge_decoders
 
     output = Path(args.output)
     cmd = ["optimum-cli", "export", "onnx", "--model", args.model,
@@ -205,14 +241,11 @@ def main() -> int:
         untie_lm_head(output / name)
     fused = fuse_encoder_attention(output / "encoder_model.onnx", config["encoder_attention_heads"])
     print(f"fused {fused}/{config['encoder_layers']} encoder attention blocks")
-    quantized = {"decoder": ("decoder_model.onnx", "decoder_with_past_model.onnx"),
-                 "all": ("encoder_model.onnx", "decoder_model.onnx", "decoder_with_past_model.onnx"),
-                 "none": ()}["none" if args.fp32 else args.quantize]
-    for name in quantized:
-        quantize(output / name)
-    print(f"INT8: {', '.join(quantized) or 'nothing'}")
-    merge_decoders(output / "decoder_model.onnx", output / "decoder_with_past_model.onnx",
-                   save_path=output / "decoder_model_merged.onnx", strict=False)
+    mode = "none" if args.fp32 else args.quantize
+    default = {"encoder": "int8" if mode == "all" else "fp32", "decoder": "fp32" if mode == "none" else "int8"}
+    build_precisions(output, default, args.variants)
+    print(f"default precision: encoder {default['encoder']}, decoder {default['decoder']}"
+          + (" (both precisions kept)" if args.variants else ""))
     smoke_test(output)
 
     if args.prune:
@@ -221,8 +254,10 @@ def main() -> int:
                 path.unlink()
                 print(f"pruned {path.name}")
     (output / "model_id.txt").write_text(args.model + "\n")  # reported as the model name by the API
-    size_mb = sum(f.stat().st_size for f in output.glob("*.onnx*") if f.name in KEEP) / 1e6
-    print(f"Exported {args.model} to {output} ({size_mb:.0f} MB of ONNX weights loaded by the API)")
+    size = lambda names: sum(f.stat().st_size for f in output.glob("*.onnx*") if f.name in names) / 1e6  # noqa: E731
+    loaded = size({"encoder_model.onnx", "decoder_model_merged.onnx"})
+    print(f"Exported {args.model} to {output} ({loaded:.0f} MB of ONNX weights loaded by the API"
+          + (f", plus {size(KEEP) - loaded:.0f} MB of other precisions loaded on request)" if args.variants else ")"))
     print(f"Run the API with: WHISPER_MODEL_DIR={output} python main.py")
     return 0
 

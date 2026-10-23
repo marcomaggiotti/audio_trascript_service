@@ -208,3 +208,39 @@ def test_initial_prompt_on_every_window():
     t.transcribe(np.zeros(16000 * 40, dtype=np.float32), "en",
                  options=DecodingOptions(initial_prompt="onnx runtime", condition_on_previous_text=True))
     assert t.decoder.prompts == [[PREV, 2, 3, SOT, EN, TRANSCRIBE], [PREV, 2, 3, 2, SOT, EN, TRANSCRIBE]]
+
+
+def test_onnx_precision_reads_the_graph_ops(tmp_path):
+    from app.asr import onnx_precision
+    (tmp_path / "q.onnx").write_bytes(b"\x08\x07...DynamicQuantizeLinear...MatMulInteger...")
+    (tmp_path / "f.onnx").write_bytes(b"\x08\x07...MatMul...Softmax...")
+    assert onnx_precision(tmp_path / "q.onnx") == "int8" and onnx_precision(tmp_path / "f.onnx") == "fp32"
+
+
+def test_precision_swaps_parts_for_one_job_and_back(tmp_path):
+    t = make([[ts(0), 0, 1, ts(2.0), EOT]] * 5)  # FakeEncoder numbers windows across calls
+    default_encoder = t.encoder
+    t.precision = {"encoder": "fp32", "decoder": "int8"}
+    t.variants = {"encoder": {"fp32": tmp_path / "e.onnx", "int8": tmp_path / "e8.onnx"},
+                  "decoder": {"int8": tmp_path / "d.onnx", "fp32": tmp_path / "d32.onnx"}}
+    loaded = []
+
+    def load(path):
+        loaded.append(path.name)
+        if path.name.startswith("e"):
+            return FakeEncoder()
+        words = (2, 3) if path.name == "d32.onnx" else (0, 1)  # the fp32 "model" writes different words
+        return ScriptedDecoder([[ts(0), *words, ts(2.0), EOT]] * 5)
+
+    t._load_session = load
+    assert t.available_precisions == {"encoder": ["fp32", "int8"], "decoder": ["fp32", "int8"]}
+    with t.precision_for("fp32", None) as used:  # the default: nothing loaded
+        assert used == {"encoder": "fp32", "decoder": "int8"} and loaded == []
+    with t.precision_for(None, "fp32") as used:
+        assert used == {"encoder": "fp32", "decoder": "fp32"} and t.encoder is default_encoder
+        assert t.transcribe(np.zeros(16000 * 3, dtype=np.float32), "en").text == "onnx runtime"
+    assert loaded == ["d32.onnx", "d.onnx"]  # swapped in, then the default loaded back
+    assert t.transcribe(np.zeros(16000 * 3, dtype=np.float32), "en").text == "hello world"
+    with pytest.raises(ValueError, match="encoder precision fp16 isn't available"):
+        with t.precision_for("fp16", None):
+            pass
